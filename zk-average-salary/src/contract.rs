@@ -13,9 +13,12 @@ use pbc_contract_common::context::ContractContext;
 use pbc_contract_common::events::EventGroup;
 use pbc_contract_common::zk::ZkClosed;
 use pbc_contract_common::zk::{CalculationStatus, SecretVarId, ZkInputDef, ZkState, ZkStateChange};
+use pbc_traits::ReadWriteState;
 use pbc_zk::Sbi32;
 use read_write_rpc_derive::ReadWriteRPC;
 use read_write_state_derive::ReadWriteState;
+use create_type_spec_derive::CreateTypeSpec;
+use zk_compute::ZkInput;
 
 /// Secret variable metadata. Unused for this contract, so we use a zero-sized struct to save space.
 #[derive(ReadWriteState, ReadWriteRPC, Debug)]
@@ -27,6 +30,33 @@ enum SecretVarType {
     SumResult {},
 }
 
+#[derive(ReadWriteState, CreateTypeSpec, Clone)]
+pub struct GenderedSumResult{
+    pub salary_sums: ZkSalarySums,
+    pub input_counts: ZkInputCounts,
+}
+
+#[derive(ReadWriteState, CreateTypeSpec, Clone)]
+pub struct ZkSalarySums {
+    pub male_salary_sum: i32,
+    pub female_salary_sum: i32,
+    pub other_salary_sum: i32,
+}
+
+#[derive(ReadWriteState, CreateTypeSpec, Clone)]
+pub struct ZkInputCounts{
+    pub male_count: i32,
+    pub female_count: i32,
+    pub other_count: i32,
+}
+
+#[derive(ReadWriteState, CreateTypeSpec, Clone)]
+pub struct GenderedAverages{
+    pub male_average_salary: i32,
+    pub female_average_salary: i32,
+    pub other_average_salary: i32,
+}
+
 /// Number of employees to wait for before starting computation. A value of 2 or below is useless.
 const MIN_NUM_EMPLOYEES: u32 = 3;
 
@@ -36,9 +66,9 @@ struct ContractState {
     /// Address allowed to start computation
     administrator: Address,
     /// Will contain the result (average) when computation is complete
-    average_salary_result: Option<u32>,
+    average_salary_result: Option<GenderedAverages>,
     /// Will contain the number of employees after starting the computation
-    num_employees: Option<u32>,
+    num_employees: u32,
 }
 
 /// Initializes contract
@@ -49,12 +79,12 @@ fn initialize(ctx: ContractContext, zk_state: ZkState<SecretVarType>) -> Contrac
     ContractState {
         administrator: ctx.sender,
         average_salary_result: None,
-        num_employees: None,
+        num_employees: 0,
     }
 }
 
 /// Adds another salary variable
-#[zk_on_secret_input(shortname = 0x40)]
+#[zk_on_secret_input(shortname = 0x40, secret_type="ZkInput")]
 fn add_salary(
     context: ContractContext,
     state: ContractState,
@@ -62,7 +92,7 @@ fn add_salary(
 ) -> (
     ContractState,
     Vec<EventGroup>,
-    ZkInputDef<SecretVarType, Sbi32>,
+    ZkInputDef<SecretVarType, ZkInput>,
 ) {
     assert!(
         zk_state
@@ -83,10 +113,11 @@ fn add_salary(
 #[zk_on_variable_inputted]
 fn inputted_variable(
     context: ContractContext,
-    state: ContractState,
+    mut state: ContractState,
     zk_state: ZkState<SecretVarType>,
     inputted_variable: SecretVarId,
 ) -> ContractState {
+    state.num_employees += 1;
     state
 }
 
@@ -110,10 +141,8 @@ fn compute_average_salary(
         zk_state.calculation_state,
     );
 
-    let num_employees = zk_state.secret_variables.len() as u32;
-    assert!(num_employees >= MIN_NUM_EMPLOYEES , "At least {MIN_NUM_EMPLOYEES} employees must have submitted and confirmed their inputs, before starting computation, but had only {num_employees}");
+    assert!(state.num_employees >= MIN_NUM_EMPLOYEES , "At least {MIN_NUM_EMPLOYEES} employees must have submitted and confirmed their inputs, before starting computation, but had only {}", state.num_employees);
 
-    state.num_employees = Some(num_employees);
     (
         state,
         vec![],
@@ -161,20 +190,44 @@ fn open_sum_variable(
         .get_variable(*opened_variables.get(0).unwrap())
         .unwrap();
 
-    let result = read_variable_u32_le(&opened_variable);
+    let result = read_variable_u32_le(&zk_state, &opened_variable.variable_id);
 
+    let averages = GenderedAverages{
+        male_average_salary: division_ignore_zero(
+            result.salary_sums.male_salary_sum,
+            result.input_counts.male_count,
+        ),
+        female_average_salary: division_ignore_zero(
+            result.salary_sums.female_salary_sum,
+            result.input_counts.female_count,
+        ),
+        other_average_salary: division_ignore_zero(
+            result.salary_sums.other_salary_sum,
+            result.input_counts.other_count,
+        ),
+    };
     let mut zk_state_changes = vec![];
     if let SecretVarType::SumResult {} = opened_variable.metadata {
-        let num_employees = state.num_employees.unwrap();
-        state.average_salary_result = Some(result / num_employees);
+        state.average_salary_result = Some(averages);
         zk_state_changes = vec![ZkStateChange::ContractDone];
+
     }
     (state, vec![], zk_state_changes)
 }
 
 /// Reads a variable's data as an u32.
-fn read_variable_u32_le(sum_variable: &ZkClosed<SecretVarType>) -> u32 {
-    let mut buffer = [0u8; 4];
-    buffer.copy_from_slice(sum_variable.data.as_ref().unwrap().as_slice());
-    <u32>::from_le_bytes(buffer)
+fn read_variable_u32_le(zk_state: &ZkState<SecretVarType>, variable_id: &SecretVarId) -> GenderedSumResult {
+    let variable = zk_state.get_variable(*variable_id).unwrap();
+    let buffer: Vec<u8> = variable.data.clone().unwrap();
+    let result = GenderedSumResult::state_read_from(&mut buffer.as_slice());
+
+    result
+}
+
+fn division_ignore_zero(numerator: i32, denominator: i32) -> i32 {
+    if denominator == 0 {
+        0
+    } else {
+        numerator / denominator
+    }
 }
