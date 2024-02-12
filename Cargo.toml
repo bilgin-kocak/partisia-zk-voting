@@ -2,8 +2,6 @@
 resolver = "2"
 
 members = [
-    "petition",
-    "zk-average-salary",
     "zk-voting",
 ]
 
